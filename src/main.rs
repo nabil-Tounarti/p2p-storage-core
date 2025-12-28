@@ -1,3 +1,4 @@
+/*
 use fuser::{Filesystem, Request, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, FileAttr, FileType, MountOption};
 use libc::ENOENT;
 use std::ffi::OsStr;
@@ -126,15 +127,11 @@ impl Filesystem for HelloFS {
 
     // other methods can be left unimplemented for this simple test
 }
- 
+*/
+
+use p2p_core::identity;
 fn main() {
-    env_logger::init();
-    let mountpoint = "/tmp/fuse-test-mount";
-    std::fs::create_dir_all(mountpoint).unwrap();
+    let identity = identity::Identity::get_or_create_peer_id().unwrap();
 
-    println!("Mounting hello-fuse at {}", mountpoint);
-    let options = vec![MountOption::RO, MountOption::FSName("hello_fuse".to_string())];
-
-    // Note: this call will block until unmounted (Ctrl+C will unmount)
-    fuser::mount2(HelloFS::new(), Path::new(mountpoint), &options).unwrap();
+    println!("you peer Id is: {0}", identity.peer_id);
 }
