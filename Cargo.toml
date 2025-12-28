@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = "0.22.1"
 env_logger = "0.11.8"
 fuser = "0.16.0"
+keyring = { version = "3.6.3", features = ["linux-native"] }
 libc = "0.2.178"
+libp2p = "0.56.0"
 log = "0.4.29"
+thiserror = "2.0.17"
