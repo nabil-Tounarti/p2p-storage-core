@@ -130,8 +130,9 @@ impl Filesystem for HelloFS {
 */
 
 use p2p_core::identity;
+
 fn main() {
-    let identity = identity::Identity::get_or_create_peer_id().unwrap();
+    let identity = identity::Identity::get_peer_id().unwrap();
 
     println!("you peer Id is: {0}", identity.peer_id);
 }
