@@ -129,10 +129,93 @@ impl Filesystem for HelloFS {
 }
 */
 
-use p2p_core::identity;
+use futures::StreamExt;
+use libp2p::{
+    Multiaddr, PeerId, StreamProtocol, identify, identity, request_response,
+    swarm::NetworkBehaviour, swarm::SwarmEvent,
+};
+use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::time::Duration;
 
-fn main() {
-    let identity = identity::Identity::get_peer_id().unwrap();
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsRequest(pub String);
 
-    println!("you peer Id is: {0}", identity.peer_id);
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsResponse(pub String);
+
+#[derive(NetworkBehaviour)]
+pub struct P2pCoreBehaviour {
+    identify: identify::Behaviour,
+    fs_rpc: request_response::cbor::Behaviour<FsRequest, FsResponse>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let local_key = identity::Keypair::generate_ed25519();
+    let local_peer_id = PeerId::from(local_key.public());
+    println!("Local peer id: {:?}", local_peer_id);
+
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
+        .with_tokio()
+        .with_tcp(
+            libp2p::tcp::Config::default(),
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )?
+        .with_behaviour(|key| {
+            Ok(P2pCoreBehaviour {
+                identify: identify::Behaviour::new(identify::Config::new(
+                    "/proto/1.0.0".into(),
+                    key.public(),
+                )),
+                fs_rpc: request_response::cbor::Behaviour::new(
+                    [(
+                        // FIX: The order must be (Protocol, Support), not (Support, Protocol)
+                        StreamProtocol::new("/fs-rpc/1.0.0"),
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default(),
+                ),
+            })
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
+
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+
+    if let Some(addr_str) = std::env::args().nth(1) {
+        let remote: Multiaddr = addr_str.parse()?;
+        swarm.dial(remote)?;
+        println!("Dialed remote address: {:?}", addr_str);
+    }
+
+    loop {
+        tokio::select! {
+            event = swarm.select_next_some() => match event {
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    println!("Listening on: {:?}", address);
+                }
+
+                SwarmEvent::Behaviour(P2pCoreBehaviourEvent::Identify(identify::Event::Received { peer_id, .. })) => {
+                    println!("Identified peer: {:?}. Sending request...", peer_id);
+                    swarm.behaviour_mut().fs_rpc.send_request(&peer_id, FsRequest("Hello!".to_string()));
+                }
+
+                // FIXED LINE: Added .. to ignore connection_id and other metadata
+                SwarmEvent::Behaviour(P2pCoreBehaviourEvent::FsRpc(request_response::Event::Message { peer, message, .. })) => {
+                    match message {
+                        request_response::Message::Request { request, channel, .. } => {
+                            println!("Received Request: '{}' from {:?}", request.0, peer);
+                            let _ = swarm.behaviour_mut().fs_rpc.send_response(channel, FsResponse("Acknowledged".to_string()));
+                        }
+                        request_response::Message::Response { response, .. } => {
+                            println!("Received Response: '{}' from {:?}", response.0, peer);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
