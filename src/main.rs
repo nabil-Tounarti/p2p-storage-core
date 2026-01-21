@@ -12,6 +12,8 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
+use std::path::{Path, PathBuf};
+use std::io::{Read, Seek, SeekFrom};
 
 // --- 1. Protocol Definitions ---
 
@@ -60,7 +62,7 @@ struct Command {
     resp_sender: oneshot::Sender<FsResponse>,
 }
 
-// --- 2. The FUSE Filesystem Implementation ---
+// --- 2. The FUSE Filesystem Implementation (Client Side) ---
 
 struct P2pFs {
     cmd_tx: mpsc::Sender<Command>,
@@ -69,36 +71,21 @@ struct P2pFs {
 
 impl P2pFs {
     fn remote_call(&self, req: FsRequest) -> Option<FsResponse> {
-        println!("  [FUSE -> Network] Request: {:?}", req);
         let (tx, rx) = oneshot::channel();
         let cmd = Command {
             peer_id: self.target_peer,
             request: req,
             resp_sender: tx,
         };
-        
         if let Err(_) = self.cmd_tx.blocking_send(cmd) { return None; }
-
-        match rx.blocking_recv() {
-            Ok(res) => {
-                println!("  [Network -> FUSE] Success: {:?}", res);
-                Some(res)
-            }
-            Err(_) => {
-                eprintln!("  [FUSE] Network Timeout");
-                None
-            }
-        }
+        rx.blocking_recv().ok()
     }
 }
 
 impl Filesystem for P2pFs {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let name_str = name.to_string_lossy();
-        // Map lookup to a path string for the provider
-        let path = if parent == 1 { format!("/{}", name_str) } else { format!("/unknown") };
-        
-        if let Some(FsResponse::FileAttr(attr)) = self.remote_call(FsRequest::Stat { path }) {
+    fn lookup(&mut self, _req: &Request, _parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let name_str = name.to_string_lossy().to_string();
+        if let Some(FsResponse::FileAttr(attr)) = self.remote_call(FsRequest::Stat { path: name_str }) {
             reply.entry(&Duration::from_secs(1), &map_attr(attr), 0);
         } else {
             reply.error(libc::ENOENT);
@@ -106,7 +93,7 @@ impl Filesystem for P2pFs {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        let path = if ino == 1 { "/".to_string() } else { "/hello.txt".to_string() };
+        let path = if ino == 1 { "/".to_string() } else { format!("file_{}", ino) };
         if let Some(FsResponse::FileAttr(attr)) = self.remote_call(FsRequest::Stat { path }) {
             reply.attr(&Duration::from_secs(1), &map_attr(attr));
         } else {
@@ -115,16 +102,14 @@ impl Filesystem for P2pFs {
     }
 
     fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        if ino != 1 {
-            reply.error(libc::ENOENT);
-            return;
-        }
+        if ino != 1 { reply.error(libc::ENOENT); return; }
         if offset == 0 {
             let _ = reply.add(1, 0, FileType::Directory, ".");
             let _ = reply.add(1, 1, FileType::Directory, "..");
             if let Some(FsResponse::DirEntries(entries)) = self.remote_call(FsRequest::ListDir { path: "/".to_string() }) {
                 for (i, entry) in entries.into_iter().enumerate() {
                     let kind = if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
+                    // We use the index as a fake inode for simplicity in this demo
                     if reply.add(2 + i as u64, (i + 2) as i64, kind, entry.name) { break; }
                 }
             }
@@ -133,8 +118,10 @@ impl Filesystem for P2pFs {
     }
 
     fn read(&mut self, _req: &Request, _ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
+        // In this simple demo, we map any read back to the provider logic
+        // For a real app, you'd track which inode maps to which filename
         if let Some(FsResponse::Data(data)) = self.remote_call(FsRequest::Read { 
-            path: "/hello.txt".to_string(), 
+            path: "READ_REPLY".to_string(), // In real app, send actual filename
             offset: offset as u64, 
             length: size 
         }) {
@@ -165,12 +152,13 @@ pub struct P2pCoreBehaviour {
     fs_rpc: request_response::cbor::Behaviour<FsRequest, FsResponse>,
 }
 
-// --- 4. Main ---
+// --- 4. Main Loop ---
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // AUTO-CLEANUP: Try to unmount old session if it exists
     let _ = std::process::Command::new("fusermount3").args(["-u", "./p2p_test"]).output();
+    let shared_dir = PathBuf::from("./shared");
+    if !shared_dir.exists() { std::fs::create_dir(&shared_dir)?; }
 
     let local_key = identity::Keypair::generate_ed25519();
     let local_peer_id = PeerId::from(local_key.public());
@@ -197,14 +185,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let remote: Multiaddr = addr_str.parse()?;
         let peer_id = remote.iter().find_map(|p| {
             if let libp2p::multiaddr::Protocol::P2p(peer_id) = p { Some(peer_id) } else { None }
-        }).expect("Address must contain PeerID (/p2p/...)");
+        }).expect("Address must contain PeerID");
 
         swarm.dial(remote)?;
         let fs = P2pFs { cmd_tx: cmd_tx.clone(), target_peer: peer_id };
         let mountpoint = "./p2p_test";
         let _ = std::fs::create_dir_all(mountpoint);
-        
-        println!(">>> Mounting FUSE at {}", mountpoint);
+        println!(">>> Mounting at {}", mountpoint);
         std::thread::spawn(move || {
             let _ = fuser::mount2(fs, mountpoint, &[MountOption::AutoUnmount, MountOption::AllowOther]);
         });
@@ -220,39 +207,63 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     println!(">>> Node reachable at: {}/p2p/{}", address, local_peer_id);
                 }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    println!(">>> NETWORK: Connection established with {:?}", peer_id);
-                }
                 SwarmEvent::Behaviour(P2pCoreBehaviourEvent::FsRpc(request_response::Event::Message { message, .. })) => {
                     match message {
                         request_response::Message::Request { request, channel, .. } => {
+                            // --- PROVIDER LOGIC: RESTRICTED TO ./shared ---
                             let resp = match request {
+                                FsRequest::ListDir { .. } => {
+                                    let mut entries = Vec::new();
+                                    if let Ok(dir) = std::fs::read_dir("./shared") {
+                                        for entry in dir.flatten() {
+                                            if let Ok(meta) = entry.metadata() {
+                                                entries.push(FsDirEntry {
+                                                    name: entry.file_name().to_string_lossy().into_owned(),
+                                                    is_dir: meta.is_dir(),
+                                                    size: meta.len(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    FsResponse::DirEntries(entries)
+                                }
                                 FsRequest::Stat { path } => {
                                     if path == "/" {
                                         FsResponse::FileAttr(FsFileAttr {
-                                            ino: 1, size: 0, nlink: 2, perm: 0o755, 
-                                            kind: FsFileType::Directory, atime: 0, mtime: 0, ctime: 0, uid: 1000, gid: 1000
-                                        })
-                                    } else if path == "/hello.txt" {
-                                        FsResponse::FileAttr(FsFileAttr {
-                                            ino: 2, size: 14, nlink: 1, perm: 0o644, 
-                                            kind: FsFileType::File, atime: 0, mtime: 0, ctime: 0, uid: 1000, gid: 1000
+                                            ino: 1, size: 0, nlink: 2, perm: 0o755, kind: FsFileType::Directory,
+                                            atime: 0, mtime: 0, ctime: 0, uid: 1000, gid: 1000
                                         })
                                     } else {
-                                        FsResponse::Error("Not found".to_string())
+                                        // Try to find the file inside ./shared
+                                        let full_path = Path::new("./shared").join(path.trim_start_matches('/'));
+                                        if let Ok(meta) = std::fs::metadata(&full_path) {
+                                            FsResponse::FileAttr(FsFileAttr {
+                                                ino: 2, size: meta.len(), nlink: 1, perm: 0o644,
+                                                kind: if meta.is_dir() { FsFileType::Directory } else { FsFileType::File },
+                                                atime: 0, mtime: 0, ctime: 0, uid: 1000, gid: 1000
+                                            })
+                                        } else { FsResponse::Error("Not found".into()) }
                                     }
-                                },
-                                FsRequest::ListDir { .. } => FsResponse::DirEntries(vec![
-                                    FsDirEntry { name: "hello.txt".to_string(), is_dir: false, size: 14 }
-                                ]),
-                                FsRequest::Read { .. } => FsResponse::Data(b"Hello P2P FS!\n".to_vec()),
+                                }
+                                FsRequest::Read { offset, length, .. } => {
+                                    // Simplified: Read the first file found in shared for the demo
+                                    if let Ok(mut dir) = std::fs::read_dir("./shared") {
+                                        if let Some(Ok(entry)) = dir.next() {
+                                            if let Ok(mut file) = std::fs::File::open(entry.path()) {
+                                                let mut buf = vec![0; length as usize];
+                                                let _ = file.seek(SeekFrom::Start(offset));
+                                                let n = file.read(&mut buf).unwrap_or(0);
+                                                buf.truncate(n);
+                                                FsResponse::Data(buf)
+                                            } else { FsResponse::Error("Read fail".into()) }
+                                        } else { FsResponse::Error("No files".into()) }
+                                    } else { FsResponse::Error("Dir fail".into()) }
+                                }
                             };
                             let _ = swarm.behaviour_mut().fs_rpc.send_response(channel, resp);
                         }
                         request_response::Message::Response { request_id, response, .. } => {
-                            if let Some(tx) = pending_requests.remove(&request_id) {
-                                let _ = tx.send(response);
-                            }
+                            if let Some(tx) = pending_requests.remove(&request_id) { let _ = tx.send(response); }
                         }
                     }
                 }
